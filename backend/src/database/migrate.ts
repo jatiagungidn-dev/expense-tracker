@@ -1,44 +1,75 @@
-import fs from "fs";
-import path from "path";
-import pool from "../config/db";
+import fs from "node:fs/promises";
+import path from "node:path";
+import pool from "../config/db.js";
 
-async function runMigration() {
-  const client = await pool.connect();
+const MIGRATIONS_TABLE = `
+  CREATE TABLE IF NOT EXISTS migrations (
+    id SERIAL PRIMARY KEY,
+    filename TEXT NOT NULL UNIQUE,
+    executed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+`;
+
+async function migrate() {
+  const migrationsDir = path.join(
+    process.cwd(),
+    "src",
+    "database",
+    "migrations",
+  );
 
   try {
-    console.log("Starting migrations...");
+    await pool.query(MIGRATIONS_TABLE);
 
-    const migrationDir = path.join(__dirname, "migrations");
-
-    const files = fs
-      .readdirSync(migrationDir)
+    const files = (await fs.readdir(migrationsDir))
       .filter((file) => file.endsWith(".sql"))
       .sort();
 
     if (files.length === 0) {
-      console.log("No migrations found");
+      console.log("No migrations found.");
       return;
     }
 
-    await client.query("BEGIN");
+    for (const filename of files) {
+      const executed = await pool.query(
+        "SELECT 1 FROM migrations WHERE filename = $1",
+        [filename],
+      );
 
-    for (const file of files) {
-      const filePath = path.join(migrationDir, file);
-      const sql = fs.readFileSync(filePath, "utf-8");
+      if (executed.rowCount && executed.rowCount > 0) {
+        console.log(`Skipped: ${filename}`);
+        continue;
+      }
 
-      console.log(`Executing migration: ${file}`);
-      await client.query(sql);
+      const sql = await fs.readFile(path.join(migrationsDir, filename), "utf8");
+
+      const client = await pool.connect();
+
+      try {
+        await client.query("BEGIN");
+        await client.query(sql);
+        await client.query("INSERT INTO migrations (filename) VALUES ($1)", [
+          filename,
+        ]);
+        await client.query("COMMIT");
+
+        console.log(`Applied: ${filename}`);
+      } catch (error) {
+        await client.query("ROLLBACK");
+        console.error(`Failed to apply migration: ${filename}`);
+        console.error(error);
+        process.exitCode = 1;
+        break;
+      } finally {
+        client.release();
+      }
     }
-
-    await client.query("COMMIT");
-    console.log("Migrations successfully");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error(err);
+  } catch (error) {
+    console.error("Migration failed:", error);
+    process.exitCode = 1;
   } finally {
-    client.release();
-    process.exit(0);
+    await pool.end();
   }
 }
 
-runMigration();
+migrate();
